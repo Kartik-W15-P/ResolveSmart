@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Environment Variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Testing / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local database / data
+*.db
+*.sqlite3
+
+# ML / model files
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Generated files
+uploads/
+outputs/
