@@ -9,6 +9,9 @@ from ..models import Assignment, Complaint, ComplaintStatusHistory, Department, 
 
 from ..services.ml_service import GrievanceTriageEngine
 
+from ..services.ml_service import GrievanceTriageEngine
+from ..services.chatbot_service import ComplaintChatbot
+
 complaints_bp = Blueprint("complaints", __name__, url_prefix="/api/complaints")
 
 
@@ -431,4 +434,74 @@ def assign_complaint(complaint_id):
             "department_id": complaint.department_id,
             "status": complaint.status
         }
+    }), 200
+
+@complaints_bp.post("/<int:complaint_id>/chat")
+@jwt_required()
+def chat_with_complaint_assistant(complaint_id):
+    user_id = int(get_jwt_identity())
+    claims = get_jwt()
+    user_role = claims.get("role")
+
+    complaint = Complaint.query.get(complaint_id)
+    if not complaint:
+        return jsonify({
+            "status": "error",
+            "message": "Complaint not found"
+        }), 404
+
+    # Security check: citizen can only query their own complaint
+    if user_role == "citizen" and complaint.citizen_id != user_id:
+        return jsonify({
+            "status": "error",
+            "message": "Access denied"
+        }), 403
+
+    data = request.get_json() or {}
+    user_message = data.get("message", "").strip()
+
+    if not user_message:
+        return jsonify({
+            "status": "error",
+            "message": "Message is required"
+        }), 400
+
+    complaint_data = {
+        "complaint_number": complaint.complaint_number,
+        "title": complaint.title,
+        "description": complaint.description,
+        "category": complaint.category,
+        "priority": complaint.priority,
+        "status": complaint.status,
+        "address": complaint.address,
+        "is_duplicate": complaint.is_duplicate,
+        "created_at": complaint.created_at.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    history_records = ComplaintStatusHistory.query.filter_by(
+        complaint_id=complaint.id
+    ).order_by(ComplaintStatusHistory.created_at.asc()).all()
+
+    timeline_events = [
+        {
+            "status": h.status,
+            "remarks": h.remarks,
+            "created_at": h.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        for h in history_records
+    ]
+
+    result = ComplaintChatbot.generate_response(
+        complaint_data=complaint_data,
+        timeline_events=timeline_events,
+        user_message=user_message
+    )
+
+    if result.get("status") == "error":
+        return jsonify(result), 500
+
+    return jsonify({
+        "status": "success",
+        "complaint_number": complaint.complaint_number,
+        "reply": result.get("reply")
     }), 200
