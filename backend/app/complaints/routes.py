@@ -7,6 +7,8 @@ from .. import db
 from ..auth.decorators import role_required
 from ..models import Assignment, Complaint, ComplaintStatusHistory, Department, User
 
+from ..services.ml_service import GrievanceTriageEngine
+
 complaints_bp = Blueprint("complaints", __name__, url_prefix="/api/complaints")
 
 
@@ -44,6 +46,46 @@ def create_complaint():
             "message": "Title and description are required"
         }), 400
 
+    # 1. AI Triage: Auto-predict category if absent or general
+    if not category:
+        category = GrievanceTriageEngine.predict_category(title, description)
+
+    # 2. AI Triage: Priority & Urgency Scoring
+    priority = GrievanceTriageEngine.evaluate_priority(title, description)
+
+    # 3. Department Association
+    department_id = None
+    matched_dept = Department.query.filter(Department.name.ilike(f"%{category[:6]}%")).first()
+    if matched_dept:
+        department_id = matched_dept.id
+
+    # 4. AI Triage: Duplicate Detection against active complaints
+    active_complaints_query = Complaint.query.filter(
+        Complaint.status.notin_(["resolved"])
+    ).all()
+
+    active_payload = [
+        {
+            "id": c.id,
+            "title": c.title,
+            "description": c.description,
+            "latitude": float(c.latitude) if c.latitude is not None else None,
+            "longitude": float(c.longitude) if c.longitude is not None else None
+        }
+        for c in active_complaints_query
+    ]
+
+    lat_val = float(latitude) if latitude is not None else None
+    lon_val = float(longitude) if longitude is not None else None
+
+    is_dup, duplicate_of_id, sim_score, dist_m = GrievanceTriageEngine.detect_duplicate(
+        new_title=title,
+        new_desc=description,
+        new_lat=lat_val,
+        new_lon=lon_val,
+        active_complaints=active_payload
+    )
+
     complaint_number = generate_complaint_number()
 
     complaint = Complaint(
@@ -51,16 +93,50 @@ def create_complaint():
         citizen_id=user.id,
         title=title,
         description=description,
-        latitude=latitude,
-        longitude=longitude,
+        latitude=lat_val,
+        longitude=lon_val,
         address=address,
         category=category,
-        priority="medium",
-        status="submitted"
+        priority=priority,
+        status="submitted",
+        department_id=department_id,
+        is_duplicate=is_dup
     )
 
     db.session.add(complaint)
     db.session.flush()
+
+    remarks = "Complaint filed by citizen"
+    if is_dup and duplicate_of_id:
+        remarks += f" [System Alert: Potential duplicate of #{duplicate_of_id} - Sim: {sim_score:.2f}]"
+
+    status_entry = ComplaintStatusHistory(
+        complaint_id=complaint.id,
+        status="submitted",
+        remarks=remarks
+    )
+    db.session.add(status_entry)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "Complaint submitted successfully",
+        "complaint": {
+            "id": complaint.id,
+            "complaint_number": complaint.complaint_number,
+            "title": complaint.title,
+            "description": complaint.description,
+            "status": complaint.status,
+            "priority": complaint.priority,
+            "category": complaint.category,
+            "is_duplicate": complaint.is_duplicate,
+            "department_id": complaint.department_id,
+            "latitude": float(complaint.latitude) if complaint.latitude is not None else None,
+            "longitude": float(complaint.longitude) if complaint.longitude is not None else None,
+            "address": complaint.address,
+            "created_at": complaint.created_at.isoformat()
+        }
+    }), 201
 
     # Audit history entry
     status_entry = ComplaintStatusHistory(
