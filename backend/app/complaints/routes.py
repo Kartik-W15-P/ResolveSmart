@@ -1,10 +1,11 @@
 import uuid
 from datetime import datetime
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
 
 from .. import db
-from ..models import Complaint, ComplaintStatusHistory, User
+from ..auth.decorators import role_required
+from ..models import Assignment, Complaint, ComplaintStatusHistory, Department, User
 
 complaints_bp = Blueprint("complaints", __name__, url_prefix="/api/complaints")
 
@@ -59,7 +60,7 @@ def create_complaint():
     )
 
     db.session.add(complaint)
-    db.session.flush()  # Flush so complaint.id is generated for history tracking
+    db.session.flush()
 
     # Audit history entry
     status_entry = ComplaintStatusHistory(
@@ -116,8 +117,6 @@ def get_my_complaints():
         "complaints": result
     }), 200
 
-from flask_jwt_extended import get_jwt
-
 
 @complaints_bp.get("/<int:complaint_id>")
 @jwt_required()
@@ -133,7 +132,7 @@ def get_complaint_details(complaint_id):
             "message": "Complaint not found"
         }), 404
 
-    # Authorization: citizens can only view their own complaints; officers/admins can view any
+    # Citizen can only view own; officer/admin can view any
     if user_role == "citizen" and complaint.citizen_id != user_id:
         return jsonify({
             "status": "error",
@@ -203,3 +202,157 @@ def get_complaint_timeline(complaint_id):
         "timeline": timeline
     }), 200
 
+
+@complaints_bp.get("/assigned")
+@role_required("officer", "admin")
+def get_assigned_complaints():
+    user_id = int(get_jwt_identity())
+    claims = get_jwt()
+    user_role = claims.get("role")
+
+    if user_role == "admin":
+        complaints = Complaint.query.order_by(Complaint.created_at.desc()).all()
+    else:
+        assigned_ids = db.select(Assignment.complaint_id).filter_by(officer_id=user_id)
+        complaints = Complaint.query.filter(Complaint.id.in_(assigned_ids)).order_by(Complaint.created_at.desc()).all()
+    result = []
+    for c in complaints:
+        result.append({
+            "id": c.id,
+            "complaint_number": c.complaint_number,
+            "title": c.title,
+            "status": c.status,
+            "priority": c.priority,
+            "category": c.category,
+            "address": c.address,
+            "latitude": float(c.latitude) if c.latitude is not None else None,
+            "longitude": float(c.longitude) if c.longitude is not None else None,
+            "created_at": c.created_at.isoformat()
+        })
+
+    return jsonify({
+        "status": "success",
+        "total": len(result),
+        "complaints": result
+    }), 200
+
+
+@complaints_bp.patch("/<int:complaint_id>/status")
+@role_required("officer", "admin")
+def update_complaint_status(complaint_id):
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    new_status = data.get("status", "").strip().lower()
+    remarks = data.get("remarks", "").strip() or f"Status changed to {new_status}"
+
+    valid_statuses = {"submitted", "assigned", "under_review", "in_progress", "resolved"}
+    if new_status not in valid_statuses:
+        return jsonify({
+            "status": "error",
+            "message": f"Invalid status. Must be one of: {', '.join(sorted(valid_statuses))}"
+        }), 400
+
+    complaint = Complaint.query.get(complaint_id)
+    if not complaint:
+        return jsonify({
+            "status": "error",
+            "message": "Complaint not found"
+        }), 404
+
+    complaint.status = new_status
+    complaint.updated_at = datetime.utcnow()
+
+    # If resolving, close any active assignments
+    if new_status == "resolved":
+        active_assignment = Assignment.query.filter_by(
+            complaint_id=complaint.id,
+            completed_at=None
+        ).first()
+        if active_assignment:
+            active_assignment.completed_at = datetime.utcnow()
+
+    history_entry = ComplaintStatusHistory(
+        complaint_id=complaint.id,
+        status=new_status,
+        remarks=remarks,
+        updated_by=user_id
+    )
+    db.session.add(history_entry)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": f"Complaint status updated to {new_status}",
+        "complaint": {
+            "id": complaint.id,
+            "complaint_number": complaint.complaint_number,
+            "status": complaint.status,
+            "updated_at": complaint.updated_at.isoformat()
+        }
+    }), 200
+
+
+@complaints_bp.post("/<int:complaint_id>/assign")
+@role_required("admin")
+def assign_complaint(complaint_id):
+    admin_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+
+    officer_id = data.get("officer_id")
+    department_id = data.get("department_id")
+    notes = data.get("notes", "").strip() or None
+
+    complaint = Complaint.query.get(complaint_id)
+    if not complaint:
+        return jsonify({
+            "status": "error",
+            "message": "Complaint not found"
+        }), 404
+
+    if officer_id:
+        officer = User.query.filter_by(id=officer_id, role="officer").first()
+        if not officer:
+            return jsonify({
+                "status": "error",
+                "message": "Target officer not found or user is not an officer"
+            }), 404
+
+    if department_id:
+        dept = Department.query.get(department_id)
+        if not dept:
+            return jsonify({
+                "status": "error",
+                "message": "Target department not found"
+            }), 404
+        complaint.department_id = dept.id
+
+    assignment = Assignment(
+        complaint_id=complaint.id,
+        officer_id=officer_id,
+        remarks=notes
+    )
+    complaint.status = "assigned"
+    complaint.updated_at = datetime.utcnow()
+
+    history_entry = ComplaintStatusHistory(
+        complaint_id=complaint.id,
+        status="assigned",
+        remarks=f"Assigned to officer {officer_id}" if officer_id else "Assigned to department",
+        updated_by=admin_id
+    )
+
+    db.session.add(assignment)
+    db.session.add(history_entry)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "Complaint assigned successfully",
+        "assignment": {
+            "complaint_id": complaint.id,
+            "officer_id": officer_id,
+            "department_id": complaint.department_id,
+            "status": complaint.status
+        }
+    }), 200
