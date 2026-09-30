@@ -12,6 +12,10 @@ from ..services.ml_service import GrievanceTriageEngine
 from ..services.ml_service import GrievanceTriageEngine
 from ..services.chatbot_service import ComplaintChatbot
 
+from flask import send_from_directory, current_app
+from ..models import ComplaintImage
+from ..services.file_service import save_complaint_image
+
 complaints_bp = Blueprint("complaints", __name__, url_prefix="/api/complaints")
 
 
@@ -505,3 +509,89 @@ def chat_with_complaint_assistant(complaint_id):
         "complaint_number": complaint.complaint_number,
         "reply": result.get("reply")
     }), 200
+
+@complaints_bp.post("/<int:complaint_id>/images")
+@jwt_required()
+def upload_complaint_image(complaint_id):
+    user_id = int(get_jwt_identity())
+    claims = get_jwt()
+    user_role = claims.get("role")
+
+    complaint = Complaint.query.get(complaint_id)
+    if not complaint:
+        return jsonify({"status": "error", "message": "Complaint not found"}), 404
+
+    # Access control: citizen can only upload to their complaint; officers/admin can upload resolution evidence
+    if user_role == "citizen" and complaint.citizen_id != user_id:
+        return jsonify({"status": "error", "message": "Access denied"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file part in request"}), 400
+
+    file = request.files["file"]
+
+    try:
+        unique_filename, file_url = save_complaint_image(file, complaint_id=complaint.id)
+    except ValueError as err:
+        return jsonify({"status": "error", "message": str(err)}), 400
+
+    complaint_image = ComplaintImage(
+        complaint_id=complaint.id,
+        file_name=unique_filename,
+        file_path=file_url
+    )
+    db.session.add(complaint_image)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "Image uploaded successfully",
+        "image": {
+            "id": complaint_image.id,
+            "complaint_id": complaint_image.complaint_id,
+            "file_name": complaint_image.file_name,
+            "file_path": complaint_image.file_path,
+            "uploaded_at": complaint_image.uploaded_at.isoformat() if complaint_image.uploaded_at else None
+        }
+    }), 201
+
+    # Authorization: citizens can only upload to their own complaints; officers/admins can upload resolution proof
+    if user_role == "citizen" and complaint.citizen_id != user_id:
+        return jsonify({"status": "error", "message": "Access denied"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"status": "error", "message": "No file part in request"}), 400
+
+    file = request.files["file"]
+
+    try:
+        image_url = save_complaint_image(file, complaint_id=complaint.id)
+    except ValueError as err:
+        return jsonify({"status": "error", "message": str(err)}), 400
+
+    complaint_image = ComplaintImage(
+        complaint_id=complaint.id,
+        image_url=image_url
+    )
+    db.session.add(complaint_image)
+    db.session.commit()
+
+    return jsonify({
+        "status": "success",
+        "message": "Image uploaded successfully",
+        "image": {
+            "id": complaint_image.id,
+            "complaint_id": complaint_image.complaint_id,
+            "image_url": complaint_image.image_url,
+            "created_at": complaint_image.created_at.isoformat()
+        }
+    }), 201
+
+
+@complaints_bp.get("/uploads/<filename>")
+def serve_uploaded_file(filename):
+    upload_dir = get_upload_dir()
+    return send_from_directory(upload_dir, filename)
+
+from ..services.file_service import save_complaint_image, get_upload_dir
+
